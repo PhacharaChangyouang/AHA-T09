@@ -1,0 +1,11 @@
+node_modules
+.next
+.git
+.env
+.env.*
+test-results
+*.log
+*.pem
+*.key
+*.dump
+*.sql

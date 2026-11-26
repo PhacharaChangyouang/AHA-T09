@@ -1,0 +1,51 @@
+name: AHA Android Flutter static and build gate
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mobile_app/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'mobile_app/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: aha-android-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  android-smoke:
+    name: Flutter analyze, unit and debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: mobile_app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+          cache: true
+      - name: Confirm Flutter and Dart SDK
+        run: flutter --version
+      - name: Resolve Android client packages
+        run: flutter pub get
+      - name: Analyze Flutter source
+        run: flutter analyze --no-fatal-infos
+      - name: Run Android client widget/unit smoke
+        run: flutter test
+      - name: Assert HTTPS-only Android networking
+        run: |
+          set -euo pipefail
+          grep -q 'usesCleartextTraffic="false"' android/app/src/main/AndroidManifest.xml
+          if grep -R -nE '(http://[^  "\x27]*(ahahealth|railway\.app))' lib; then
+            echo "Insecure backend origin found" >&2
+            exit 1
+          fi
+      - name: Build non-distributable debug APK (no signing secrets)
+        run: flutter build apk --debug --no-pub

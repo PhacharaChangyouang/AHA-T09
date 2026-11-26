@@ -1,0 +1,38 @@
+name: AHA GitHub security baseline
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - 'mobile_app/**'
+      - 'ci/**'
+      - 'scripts/security/**'
+      - 'tests/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - 'mobile_app/**'
+      - 'ci/**'
+      - 'scripts/security/**'
+      - 'tests/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  supply-chain-baseline:
+    name: Pinned Actions and safe npm lifecycle guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check workflow privilege and supply-chain indicators
+        run: python3 scripts/security/check-github-actions.py
+      - name: Security guard regression tests
+        run: python3 -m unittest discover -s tests/security -p 'test_*.py' -v

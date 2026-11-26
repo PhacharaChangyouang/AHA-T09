@@ -1,0 +1,17 @@
+{
+  "name": "AHA - AI Health Assistant",
+  "short_name": "AHA",
+  "description": "ผู้ช่วยสุขภาพอัจฉริยะสำหรับผู้สูงอายุและผู้ดูแล",
+  "start_url": "/home",
+  "id": "/home",
+  "scope": "/",
+  "display": "standalone",
+  "prefer_related_applications": false,
+  "background_color": "#f8fdff",
+  "theme_color": "#0ea9e9",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

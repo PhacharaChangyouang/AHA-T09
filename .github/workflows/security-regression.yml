@@ -1,0 +1,171 @@
+name: AHA Security Regression
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - 'mobile_app/**'
+      - 'ci/**'
+      - 'scripts/security/**'
+      - 'tests/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - 'mobile_app/**'
+      - 'ci/**'
+      - 'scripts/security/**'
+      - 'tests/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-tests:
+    name: Backend security tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [auth-service, reminder-service, notification-service]
+    defaults:
+      run:
+        working-directory: backend/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.23.4'
+          cache: npm
+          cache-dependency-path: backend/${{ matrix.service }}/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm test -- --runInBand
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test-only-not-a-production-secret-12345678901234567890
+          JWT_REFRESH_SECRET: separate-test-only-not-a-production-secret-123456789012345
+          INTERNAL_API_KEY: test-only-internal-key-abcdefghijklmnopqrstuvxyz12345
+          PIN_PEPPER: test-only-pepper-abcdefghijklmnopqrstuvxyz1234567890
+
+  frontend-checks:
+    name: Frontend lint and production build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.23.4'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: node --test tests/pwa-install.cjs tests/push-readiness.cjs tests/push-timing.cjs tests/landing-root.test.mjs
+      - run: node tests/security-audit.cjs
+      - run: node tests/reminder-sync.cjs
+      - run: node tests/account-security.cjs
+      - run: node tests/pin-email-recovery.cjs
+      - run: node tests/sponsors.cjs
+      - run: node tests/layout-refresh.cjs
+      - run: node tests/ui-experience.cjs
+      - run: npm run test:voice
+      - run: node tests/voice-dialogue.cjs
+      - run: node tests/mobile-feedback.cjs
+      - run: node tests/attack-xss-matrix.cjs
+      - run: npm run lint
+      - run: node --test tests/lint-toolchain.test.mjs
+      - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+      - name: Verify production-style landing routes without secrets
+        run: node tests/landing-route.http.cjs
+      - name: Install isolated viewport test package
+        timeout-minutes: 3
+        run: npm install --prefix "$RUNNER_TEMP/aha-viewport-tools" --no-save --ignore-scripts playwright@1.62.1
+      - name: Install Chromium for viewport checks
+        timeout-minutes: 4
+        run: '"$RUNNER_TEMP/aha-viewport-tools/node_modules/.bin/playwright" install --with-deps chromium --only-shell'
+      - name: Verify public landing layout and links in Chromium
+        run: NODE_PATH="$RUNNER_TEMP/aha-viewport-tools/node_modules" node tests/landing-root.viewport.cjs
+      - name: Check AHA conversation viewports in Chromium
+        run: |
+          NODE_PATH="$RUNNER_TEMP/aha-viewport-tools/node_modules" node tests/pwa-install.viewport.cjs
+          NODE_PATH="$RUNNER_TEMP/aha-viewport-tools/node_modules" node tests/sponsors.viewport.cjs
+          NODE_PATH="$RUNNER_TEMP/aha-viewport-tools/node_modules" node tests/pin-email-recovery.viewport.cjs
+          NODE_PATH="$RUNNER_TEMP/aha-viewport-tools/node_modules" node tests/voice-viewport.cjs
+          NODE_PATH="$RUNNER_TEMP/aha-viewport-tools/node_modules" node tests/caregiver-reports.viewport.cjs
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: aha-voice-viewport
+          path: |
+            frontend/test-results/pwa-install/
+            frontend/test-results/sponsors/
+            frontend/test-results/pin-recovery/
+            frontend/test-results/voice-viewport/
+            frontend/test-results/caregiver-reports/
+            frontend/test-results/landing-root/
+          retention-days: 7
+
+
+  refresh-postgres-integration:
+    name: Refresh rotation and retention against isolated PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: aha_ci_security
+          POSTGRES_USER: aha_ci
+          POSTGRES_PASSWORD: ephemeral-ci-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aha_ci -d aha_ci_security"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: backend/auth-service
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.23.4'
+          cache: npm
+          cache-dependency-path: backend/auth-service/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: node tests/refresh-postgres.integration.cjs
+        env:
+          NODE_ENV: test
+          AHA_EPHEMERAL_DB_TEST: 'true'
+          DATABASE_URL: postgres://aha_ci:ephemeral-ci-only-password@127.0.0.1:5432/aha_ci_security
+          JWT_SECRET: test-only-access-secret-123456789012345678901234567890
+          JWT_REFRESH_SECRET: test-only-refresh-secret-123456789012345678901234567890
+      - run: node tests/pin-email-postgres.integration.cjs
+        env:
+          NODE_ENV: test
+          AHA_EPHEMERAL_DB_TEST: 'true'
+          DATABASE_URL: postgres://aha_ci:ephemeral-ci-only-password@127.0.0.1:5432/aha_ci_security
+          JWT_SECRET: test-only-access-secret-123456789012345678901234567890
+          JWT_REFRESH_SECRET: test-only-refresh-secret-123456789012345678901234567890
+          INTERNAL_API_KEY: test-only-internal-secret-123456789012345678901234567890
+      - run: npm ci --ignore-scripts
+        working-directory: backend/notification-service
+      - run: node tests/retention-postgres.integration.cjs
+        working-directory: backend/notification-service
+        env:
+          NODE_ENV: test
+          AHA_EPHEMERAL_DB_TEST: 'true'
+          DATABASE_URL: postgres://aha_ci:ephemeral-ci-only-password@127.0.0.1:5432/aha_ci_security

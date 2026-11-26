@@ -1,0 +1,400 @@
+require('dotenv').config();
+require('./config/academic-network').assertAcademicEnvironment();
+
+const express = require('express');
+const helmet = require('helmet');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const pool = require('./config/db');
+const authenticate = require('./middlewares/authenticate');
+const caregiverRoutes = require('./caregiver.routes');
+const caregiverReports = require('./caregiver-reports');
+const caregiverReportRoutes = require('./caregiver-report.routes');
+const { startScheduler } = require('./scheduler');
+const migrate = require('./config/migrate');
+
+const app = express();
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+
+async function ensureRuntimeSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reminder_logs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      reminder_id UUID NOT NULL,
+      user_id UUID NOT NULL,
+      scheduled_date DATE NOT NULL,
+      scheduled_time TIME NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'taken'
+        CHECK (status IN ('taken', 'skipped')),
+      taken_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (reminder_id, scheduled_date, scheduled_time)
+    )
+  `);
+
+  await pool.query(`
+    ALTER TABLE reminders
+    ADD COLUMN IF NOT EXISTS snooze_until TIMESTAMPTZ
+  `);
+
+  await pool.query(`
+    ALTER TABLE reminders
+    ADD COLUMN IF NOT EXISTS last_late_triggered_key VARCHAR(255)
+  `);
+}
+
+function validateReminder(body, { partial = false } = {}) {
+  const name = String(body.medicine_name ?? '').trim();
+  const dosage = String(body.dosage ?? '').trim();
+  const time = String(body.reminder_time ?? '').trim();
+  const frequency = body.frequency ?? (partial ? undefined : 'daily');
+  const days = body.days_of_week ?? (partial ? undefined : ['monday','tuesday','wednesday','thursday','friday','saturday','sunday']);
+  const allowedDays = new Set(['monday','tuesday','wednesday','thursday','friday','saturday','sunday']);
+  if (!partial && (!name || !time)) return 'medicine_name and reminder_time are required';
+  if (body.medicine_name !== undefined && (!name || name.length > 120)) return 'medicine_name must contain 1–120 characters';
+  if (body.dosage !== undefined && dosage.length > 100) return 'dosage must not exceed 100 characters';
+  if (body.reminder_time !== undefined && !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return 'reminder_time must be HH:MM';
+  if (frequency !== undefined && !['daily', 'weekly'].includes(frequency)) return 'frequency must be daily or weekly';
+  if (days !== undefined && (!Array.isArray(days) || days.length < 1 || days.length > 7 || days.some((day) => !allowedDays.has(day)))) return 'days_of_week is invalid';
+  for (const key of ['start_date', 'end_date']) {
+    if (body[key] !== undefined && body[key] !== null && body[key] !== '' && !/^\d{4}-\d{2}-\d{2}$/.test(String(body[key]))) return `${key} must be YYYY-MM-DD`;
+  }
+  if (body.start_date && body.end_date && String(body.end_date) < String(body.start_date)) return 'end_date must not be before start_date';
+  if (body.is_active !== undefined && typeof body.is_active !== 'boolean') return 'is_active must be boolean';
+  return null;
+}
+
+app.use(helmet());
+
+const allowedOrigins = ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:8080', 'http://127.0.0.1:8080', 'https://localhost:3443'];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
+app.use(express.json({ limit: '32kb' }));
+app.param('id', (req, res, next, value) => UUID_PATTERN.test(value)
+  ? next()
+  : res.status(400).json({ success: false, message: 'Invalid id' }));
+
+app.use('/api', rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => Boolean(process.env.INTERNAL_API_KEY && req.headers['x-internal-api-key'] === process.env.INTERNAL_API_KEY),
+  message: { success: false, message: 'เรียกใช้งานระบบยาบ่อยเกินไป กรุณาลองใหม่ภายหลัง' },
+}));
+
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ success: true, service: 'reminder-service', status: 'ok' });
+  } catch (error) {
+    console.error(error);
+    res.status(503).json({ success: false, service: 'reminder-service', status: 'database_unavailable' });
+  }
+});
+
+
+async function notifyLinkedMedicationStatus(userId, reminder, action, minutes = null) {
+  const authUrl = process.env.AUTH_SERVICE_URL;
+  const notificationUrl = process.env.NOTIFICATION_SERVICE_URL;
+  const internalKey = process.env.INTERNAL_API_KEY;
+  if (!authUrl || !notificationUrl || !internalKey) return;
+  const recipientsResponse = await fetch(`${authUrl.replace(/\/$/, '')}/family/internal/${userId}/recipients`, { headers: { 'x-internal-api-key': internalKey }, redirect: 'error', signal: AbortSignal.timeout(10000) });
+  if (!recipientsResponse.ok) throw new Error(`Medication status recipient lookup failed: ${recipientsResponse.status}`);
+  const payload = await recipientsResponse.json();
+  const recipients = Array.isArray(payload.data) ? [...new Set(payload.data)].filter((id) => String(id) !== String(userId)) : [];
+  const title = action === 'taken' ? 'ผู้สูงอายุทานยาแล้ว' : 'ผู้สูงอายุเลื่อนเวลาเตือนยา';
+  const message = action === 'taken'
+    ? `ผู้สูงอายุยืนยันว่าทานยา ${reminder.medicine_name}${reminder.dosage ? ` (${reminder.dosage})` : ''} แล้ว`
+    : `ผู้สูงอายุเลื่อนการเตือนยา ${reminder.medicine_name} ออกไป ${minutes || 10} นาที`;
+  for (const recipientId of recipients) {
+    const response = await fetch(`${notificationUrl.replace(/\/$/, '')}/api/notifications`, {
+      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
+      headers: { 'Content-Type': 'application/json', 'x-internal-api-key': internalKey },
+      body: JSON.stringify({ user_id: recipientId, type: 'caregiver_medicine_status', title, message, related_id: reminder.id, dedupe_key: `medicine-status:${userId}:${reminder.id}:${action}:${Date.now()}` }),
+    });
+    if (!response.ok) {
+      await response.text(); // Drain upstream body without logging potentially sensitive data.
+      console.error('Medication status notification failed:', response.status);
+    }
+  }
+}
+
+
+
+app.get('/api/reminders', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, medicine_name, dosage, reminder_time, frequency,
+             days_of_week, start_date, end_date, is_active,
+             last_triggered_key, snooze_until, created_at, updated_at
+      FROM reminders
+      WHERE user_id = $1
+      ORDER BY reminder_time ASC
+    `, [req.user.id]);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to fetch reminders' });
+  }
+});
+
+app.get('/api/reminders/today', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        r.*,
+        CASE WHEN l.id IS NOT NULL AND l.status = 'taken' THEN true ELSE false END AS taken,
+        l.taken_at
+      FROM reminders r
+      LEFT JOIN reminder_logs l
+        ON l.reminder_id = r.id
+       AND l.user_id = r.user_id
+       AND l.scheduled_date = (now() AT TIME ZONE 'Asia/Bangkok')::date
+       AND l.scheduled_time = r.reminder_time
+      WHERE r.user_id = $1
+        AND r.is_active = true
+        AND (r.start_date IS NULL OR r.start_date <= (now() AT TIME ZONE 'Asia/Bangkok')::date)
+        AND (r.end_date IS NULL OR r.end_date >= (now() AT TIME ZONE 'Asia/Bangkok')::date)
+      ORDER BY r.reminder_time ASC
+    `, [req.user.id]);
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to fetch today reminders' });
+  }
+});
+
+app.post('/api/reminders/:id/taken', authenticate, async (req, res) => {
+  try {
+    const reminder = await pool.query(
+      'SELECT * FROM reminders WHERE id = $1 AND user_id = $2 AND is_active = true',
+      [req.params.id, req.user.id]
+    );
+    if (!reminder.rowCount) return res.status(404).json({ success: false, message: 'Reminder not found' });
+
+    const result = await pool.query(`
+      INSERT INTO reminder_logs (reminder_id, user_id, scheduled_date, scheduled_time, status, taken_at)
+      VALUES ($1, $2, (now() AT TIME ZONE 'Asia/Bangkok')::date, $3, 'taken', now())
+      ON CONFLICT (reminder_id, scheduled_date, scheduled_time)
+      DO UPDATE SET status='taken', taken_at=now()
+      RETURNING *
+    `, [req.params.id, req.user.id, reminder.rows[0].reminder_time]);
+
+    await pool.query(
+      'UPDATE reminders SET snooze_until = NULL, updated_at = now() WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.id]
+    );
+
+    try { await notifyLinkedMedicationStatus(req.user.id, reminder.rows[0], 'taken'); } catch (notifyError) { console.error('Taken status notification failed:', notifyError); }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to mark medicine as taken' });
+  }
+});
+
+app.post('/api/reminders/:id/snooze', authenticate, async (req, res) => {
+  const minutes = Number(req.body?.minutes ?? 10);
+
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 120) {
+    return res.status(400).json({ success: false, message: 'minutes must be an integer between 1 and 120' });
+  }
+
+  try {
+    const result = await pool.query(`
+      UPDATE reminders
+      SET snooze_until = now() + make_interval(mins => $1),
+          updated_at = now()
+      WHERE id = $2 AND user_id = $3 AND is_active = true
+      RETURNING *
+    `, [minutes, req.params.id, req.user.id]);
+
+    if (!result.rowCount) {
+      return res.status(404).json({ success: false, message: 'Reminder not found' });
+    }
+
+    try { await notifyLinkedMedicationStatus(req.user.id, result.rows[0], 'snooze', minutes); } catch (notifyError) { console.error('Snooze status notification failed:', notifyError); }
+    res.json({
+      success: true,
+      message: `Reminder snoozed for ${minutes} minutes`,
+      data: result.rows[0],
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to snooze reminder' });
+  }
+});
+
+app.get('/api/reminders/:id', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM reminders WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.id]
+    );
+    if (!result.rowCount) return res.status(404).json({ success: false, message: 'Reminder not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to fetch reminder' });
+  }
+});
+
+app.post('/api/reminders', authenticate, async (req, res) => {
+  const {
+    medicine_name, dosage, reminder_time, frequency = 'daily',
+    days_of_week = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'],
+    start_date, end_date, is_active = true,
+  } = req.body;
+
+  const validation = validateReminder(req.body);
+  if (validation) return res.status(400).json({ success: false, message: validation });
+
+  try {
+    const result = await pool.query(`
+      INSERT INTO reminders
+        (user_id, medicine_name, dosage, reminder_time, frequency, days_of_week, start_date, end_date, is_active)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      RETURNING *
+    `, [
+      req.user.id, String(medicine_name).trim(), String(dosage ?? '').trim() || null, reminder_time, frequency,
+      days_of_week, start_date || null, end_date || null, Boolean(is_active),
+    ]);
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to create reminder' });
+  }
+});
+
+app.put('/api/reminders/:id', authenticate, async (req, res) => {
+  const {
+    medicine_name, dosage, reminder_time, frequency,
+    days_of_week, start_date, end_date, is_active,
+  } = req.body;
+
+  const validation = validateReminder(req.body, { partial: true });
+  if (validation) return res.status(400).json({ success: false, message: validation });
+
+  try {
+    const result = await pool.query(`
+      UPDATE reminders
+      SET medicine_name = COALESCE($1, medicine_name),
+          dosage = CASE WHEN $2::text IS NULL THEN dosage ELSE NULLIF($2::text, '') END,
+          reminder_time = COALESCE($3, reminder_time),
+          frequency = COALESCE($4, frequency),
+          days_of_week = COALESCE($5, days_of_week),
+          start_date = CASE WHEN $6::text IS NULL THEN start_date ELSE NULLIF($6::text, '')::date END,
+          end_date = CASE WHEN $7::text IS NULL THEN end_date ELSE NULLIF($7::text, '')::date END,
+          is_active = COALESCE($8, is_active),
+          updated_at = now()
+      WHERE id = $9 AND user_id = $10
+      RETURNING *
+    `, [
+      medicine_name !== undefined ? String(medicine_name).trim() : null,
+      dosage !== undefined ? String(dosage ?? '').trim() : null,
+      reminder_time || null, frequency || null, days_of_week || null,
+      start_date !== undefined ? String(start_date ?? '') : null,
+      end_date !== undefined ? String(end_date ?? '') : null,
+      typeof is_active === 'boolean' ? is_active : null,
+      req.params.id, req.user.id,
+    ]);
+    if (!result.rowCount) return res.status(404).json({ success: false, message: 'Reminder not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to update reminder' });
+  }
+});
+
+app.patch('/api/reminders/:id/status', authenticate, async (req, res) => {
+  if (typeof req.body.is_active !== 'boolean') {
+    return res.status(400).json({ success: false, message: 'is_active must be boolean' });
+  }
+  try {
+    const result = await pool.query(
+      'UPDATE reminders SET is_active=$1, snooze_until=NULL, updated_at=now() WHERE id=$2 AND user_id=$3 RETURNING *',
+      [req.body.is_active, req.params.id, req.user.id]
+    );
+    if (!result.rowCount) return res.status(404).json({ success: false, message: 'Reminder not found' });
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to update reminder status' });
+  }
+});
+
+app.delete('/api/reminders/:id', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM reminders WHERE id=$1 AND user_id=$2 RETURNING id',
+      [req.params.id, req.user.id]
+    );
+    if (!result.rowCount) return res.status(404).json({ success: false, message: 'Reminder not found' });
+    res.json({ success: true, message: 'Reminder deleted' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to delete reminder' });
+  }
+});
+
+// Caregiver-only dashboard and medication management.
+// These routes are mounted separately so the existing elderly reminder API stays unchanged.
+app.use('/api/caregiver/reports', caregiverReportRoutes);
+app.use('/api/caregiver', caregiverRoutes);
+
+app.use((req, res) => res.status(404).json({ success: false, message: 'Not found' }));
+app.use((error, req, res, next) => {
+  console.error(error);
+  if (error.message === 'Not allowed by CORS') {
+    return res.status(403).json({ success: false, message: 'CORS origin not allowed' });
+  }
+  const status = error.statusCode || error.status || 500;
+  res.status(status).json({ success: false, message: status === 500 ? 'Internal server error' : error.message });
+});
+
+const PORT = process.env.PORT || 3002;
+
+function assertProductionSecurity() {
+  if (process.env.NODE_ENV !== 'production') return;
+  const values = [String(process.env.JWT_SECRET || ''), String(process.env.INTERNAL_API_KEY || '')];
+  const weak = (value) => value.length < 48 || /replace|change|example|development|password|secret/i.test(value) || new Set(value).size < 12;
+  if (values.some(weak) || values[0] === values[1]) {
+    throw new Error('Production JWT_SECRET and INTERNAL_API_KEY must be different random values of at least 48 characters');
+  }
+}
+
+if (require.main === module) {
+  assertProductionSecurity();
+  migrate({ closePool: false })
+    .then(() => ensureRuntimeSchema())
+    .then(() => caregiverReports.ensureSchema(pool))
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Reminder service running on port ${PORT}`);
+        startScheduler();
+        let reportRunning=false;
+        const runReports=async()=>{if(reportRunning)return;reportRunning=true;try{await caregiverReports.runMailJobs(pool);}catch(_){console.error('Caregiver report worker unavailable');}finally{reportRunning=false;}};
+        runReports();setInterval(runReports,60000);
+      });
+    })
+    .catch((error) => {
+      console.error('Reminder runtime schema failed:', error);
+      process.exit(1);
+    });
+}
+
+module.exports = app;
+// Export the exact runtime schema bootstrap for isolated CI without starting
+// background schedulers or running any production-side effects.
+module.exports.ensureRuntimeSchema = ensureRuntimeSchema;

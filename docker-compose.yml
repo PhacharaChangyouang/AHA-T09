@@ -1,0 +1,153 @@
+name: aha-t09-academic
+
+services:
+  api-gateway:
+    image: nginx:alpine
+    ports:
+      - '127.0.0.1:8080:80'
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [auth-service, reminder-service, notification-service]
+    networks: [academic-local]
+    security_opt: ['no-new-privileges:true']
+
+  auth-service:
+    build: ./backend/auth-service
+    ports:
+      - '127.0.0.1:3001:3001'
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      FRONTEND_URL: http://localhost:3000
+      DB_HOST: auth-db
+      DB_PORT: 5432
+      DB_NAME: auth_db
+      DB_USER: aha_t09
+      DB_PASSWORD: ${AHA_T09_DB_AUTH_PASSWORD:?Generate academic DB password}
+      JWT_SECRET: ${AHA_T09_JWT_SECRET:?Generate academic JWT secret}
+      INTERNAL_API_KEY: ${AHA_T09_INTERNAL_API_KEY:?Generate academic internal key}
+      AUTH_SERVICE_URL: http://auth-service:3001
+      NOTIFICATION_SERVICE_URL: http://notification-service:3003
+      CAREGIVER_REPORT_EMAIL_ENABLED: 'false'
+      PIN_RECOVERY_NOTICES_ENABLED: 'false'
+      JWT_REFRESH_SECRET: ${AHA_T09_JWT_REFRESH_SECRET:?Generate academic refresh secret}
+      PIN_PEPPER: ${AHA_T09_PIN_PEPPER:?Generate academic PIN pepper}
+      REGISTRATION_ENABLED: 'true'
+    depends_on:
+      auth-db:
+        condition: service_healthy
+    networks: [academic-local]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+
+  auth-db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: auth_db
+      POSTGRES_USER: aha_t09
+      POSTGRES_PASSWORD: ${AHA_T09_DB_AUTH_PASSWORD:?Generate academic DB password}
+    volumes:
+      - auth-academic-data:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U aha_t09 -d auth_db']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [academic-local]
+
+  reminder-service:
+    build: ./backend/reminder-service
+    ports:
+      - '127.0.0.1:3002:3002'
+    environment:
+      NODE_ENV: development
+      PORT: 3002
+      FRONTEND_URL: http://localhost:3000
+      DB_HOST: reminder-db
+      DB_PORT: 5432
+      DB_NAME: reminder_db
+      DB_USER: aha_t09
+      DB_PASSWORD: ${AHA_T09_DB_REMINDER_PASSWORD:?Generate academic DB password}
+      JWT_SECRET: ${AHA_T09_JWT_SECRET:?Generate academic JWT secret}
+      INTERNAL_API_KEY: ${AHA_T09_INTERNAL_API_KEY:?Generate academic internal key}
+      AUTH_SERVICE_URL: http://auth-service:3001
+      NOTIFICATION_SERVICE_URL: http://notification-service:3003
+      CAREGIVER_REPORT_EMAIL_ENABLED: 'false'
+      PIN_RECOVERY_NOTICES_ENABLED: 'false'
+    depends_on:
+      reminder-db:
+        condition: service_healthy
+    networks: [academic-local]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+
+  reminder-db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: reminder_db
+      POSTGRES_USER: aha_t09
+      POSTGRES_PASSWORD: ${AHA_T09_DB_REMINDER_PASSWORD:?Generate academic DB password}
+    volumes:
+      - reminder-academic-data:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U aha_t09 -d reminder_db']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [academic-local]
+
+  notification-service:
+    build: ./backend/notification-service
+    ports:
+      - '127.0.0.1:3003:3003'
+    environment:
+      NODE_ENV: development
+      PORT: 3003
+      FRONTEND_URL: http://localhost:3000
+      DB_HOST: notification-db
+      DB_PORT: 5432
+      DB_NAME: notification_db
+      DB_USER: aha_t09
+      DB_PASSWORD: ${AHA_T09_DB_NOTIFICATION_PASSWORD:?Generate academic DB password}
+      JWT_SECRET: ${AHA_T09_JWT_SECRET:?Generate academic JWT secret}
+      INTERNAL_API_KEY: ${AHA_T09_INTERNAL_API_KEY:?Generate academic internal key}
+      AUTH_SERVICE_URL: http://auth-service:3001
+      NOTIFICATION_SERVICE_URL: http://notification-service:3003
+      CAREGIVER_REPORT_EMAIL_ENABLED: 'false'
+      PIN_RECOVERY_NOTICES_ENABLED: 'false'
+    depends_on:
+      notification-db:
+        condition: service_healthy
+    networks: [academic-local]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+
+  notification-db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: notification_db
+      POSTGRES_USER: aha_t09
+      POSTGRES_PASSWORD: ${AHA_T09_DB_NOTIFICATION_PASSWORD:?Generate academic DB password}
+    volumes:
+      - notification-academic-data:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U aha_t09 -d notification_db']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [academic-local]
+
+networks:
+  academic-local:
+    internal: true
+
+volumes:
+  auth-academic-data:
+  reminder-academic-data:
+  notification-academic-data:
