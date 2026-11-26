@@ -1,0 +1,3 @@
+import LegalDocument from '../../components/LegalDocument';
+export const metadata = { title: "ข้อกำหนดการใช้บริการ — AHA-T09" };
+export default function AcademicPolicyPage() { return <LegalDocument eyebrow="ACADEMIC EDITION" title="ข้อกำหนดการใช้บริการ" summary="ขอบเขตสำหรับการทดสอบและสาธิตโครงงาน T09 ไม่ใช่นโยบายของระบบที่ให้บริการจริง"><section><h2>ขอบเขตการศึกษา</h2><p>AHA-T09 เป็นระบบสำหรับสาธิตและทดสอบซอฟต์แวร์ ไม่ใช่บริการสุขภาพจริง ไม่ใช้ตั้งเวลายาหรือขอความช่วยเหลือฉุกเฉินในชีวิตจริง หากเกิดเหตุฉุกเฉินให้โทร 1669</p></section><section><h2>การใช้งานอย่างปลอดภัย</h2><p>ใช้เฉพาะข้อมูลจำลอง บัญชีทดสอบ และสภาพแวดล้อมที่ทีมได้รับอนุญาต ห้ามนำ credentials หรือฐานข้อมูล Production มาใช้</p></section></LegalDocument>; }

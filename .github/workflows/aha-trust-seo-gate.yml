@@ -1,0 +1,80 @@
+name: AHA Trust & SEO Gate
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'backend/notification-service/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'backend/notification-service/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+jobs:
+  frontend-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.23.4'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install exact dependencies
+        run: npm ci --ignore-scripts
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+      - name: Build Next.js
+        run: npm run build
+      - name: Assert trust links and support form
+        run: |
+          node - <<'NODE'
+          const fs=require('node:fs');
+          const p=fs.readFileSync('src/app/profile/page.js','utf8');
+          const m=fs.readFileSync('public/manifest.json','utf8');
+          const test=(ok,message)=>{if(!ok) throw Error(message)};
+          test((p.match(/onSubmit=\{submitSupport\}/g)||[]).length===1,'Support form must be unique');
+          test(!/mailto:/i.test(p), 'Direct email must not be linked');
+          for(const url of ['https://www.tiktok.com/@ahahealth.online','https://fastwork.co/byob/SWEsKEoTzr','https://phacharaportfolio.vercel.app/']) test(p.includes(url),'Missing social link: '+url);
+          for(const url of ['https://www.tiktok.com/@ahahealth.online','https://fastwork.co/byob/SWEsKEoTzr','https://phacharaportfolio.vercel.app/']) {
+            const anchor = p.split('<a href="'+url)[1]?.split('</a>')[0] || '';
+            test(anchor.includes('target="_blank"') && anchor.includes('rel="noopener noreferrer"'),'Unsafe external link: '+url);
+          }
+          JSON.parse(m);
+          for(const size of [192,512]) {
+            const file='public/icons/icon-'+size+'.png';
+            test(fs.existsSync(file),'Missing icon: '+file);
+            const b=fs.readFileSync(file);
+            test(b.length>1000 && b.toString('hex',0,8)==='89504e470d0a1a0a','Invalid PNG: '+file);
+            test(b.readUInt32BE(16)===size && b.readUInt32BE(20)===size,'Wrong PNG dimensions: '+file);
+          }
+          test(fs.statSync('public/favicon.ico').size>1000,'Invalid ICO favicon');
+          console.log('Trust & SEO static checks passed');
+          NODE
+  notification-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    defaults:
+      run:
+        working-directory: backend/notification-service
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.23.4'
+          cache: 'npm'
+          cache-dependency-path: backend/notification-service/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm test

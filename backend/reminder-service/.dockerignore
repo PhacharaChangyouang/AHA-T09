@@ -1,0 +1,15 @@
+# Only application source belongs in the build context.
+.env
+.env.*
+!.env.example
+node_modules
+.git
+coverage
+test-results
+logs
+*.log
+*.dump
+*.sql.gz
+*.bak
+*.pem
+*.key

@@ -1,0 +1,614 @@
+require('dotenv').config();
+require('./config/academic-network').assertAcademicEnvironment();
+
+const express = require('express');
+const helmet = require('helmet');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+
+const pool = require('./config/db');
+const authenticate = require('./middlewares/authenticate');
+const { startNotificationRetention } = require('./retention');
+const { hasLocationFields } = require('./config/academic-sos');
+
+const app = express();
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+
+const pushConfigured = false; // No real Web Push in Academic Edition.
+
+async function ensureRuntimeSchema() {
+  await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      type VARCHAR(50) NOT NULL,
+      title VARCHAR(200) NOT NULL,
+      message TEXT NOT NULL,
+      related_id UUID,
+      is_read BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      read_at TIMESTAMPTZ,
+      dedupe_key VARCHAR(255) UNIQUE,
+      scheduled_at TIMESTAMPTZ,
+      delivered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    ALTER TABLE notifications
+    ADD COLUMN IF NOT EXISTS dedupe_key VARCHAR(255)
+  `);
+
+  await pool.query(`
+    ALTER TABLE notifications
+    ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL,
+      endpoint TEXT NOT NULL UNIQUE,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      user_agent TEXT,
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user_id
+    ON push_subscriptions(user_id, enabled)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_notifications_user_id
+    ON notifications(user_id)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_notifications_is_read
+    ON notifications(user_id, is_read)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_notifications_created_at
+    ON notifications(created_at DESC)
+  `);
+}
+
+async function sendPushToUser() {
+  // Do not claim delivery; notifications remain in the synthetic in-app database.
+  return { sent: 0, skipped: true };
+}
+
+function isAllowedPushEndpoint(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.username || url.password || url.port) return false;
+    const host = url.hostname.toLowerCase();
+    return host === 'fcm.googleapis.com'
+      || host === 'updates.push.services.mozilla.com'
+      || host === 'push.services.mozilla.com'
+      || host === 'web.push.apple.com'
+      || host === 'notify.windows.com'
+      || host.endsWith('.notify.windows.com');
+  } catch (_) {
+    return false;
+  }
+}
+
+async function pushNotificationRow(row) {
+  if (!row) return { sent: 0, skipped: true };
+
+  return sendPushToUser(row.user_id, {
+    notificationId: row.id,
+    type: row.type,
+    title: row.title,
+    message: row.message,
+    relatedId: row.related_id || null,
+    url: '/?aha_notification=1',
+    actions: row.type === 'medicine_reminder'
+      ? [
+          { action: 'snooze', title: 'เลื่อน 10 นาที' },
+          { action: 'taken', title: 'ทานยาแล้ว' },
+        ]
+      : [],
+  });
+}
+
+app.use(helmet());
+
+const allowedOrigins = ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:8080', 'http://127.0.0.1:8080', 'https://localhost:3443'];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
+app.use(express.json({ limit: '32kb' }));
+app.param('id', (req, res, next, value) => UUID_PATTERN.test(value)
+  ? next()
+  : res.status(400).json({ success: false, message: 'Invalid id' }));
+
+app.use('/api', rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => Boolean(process.env.INTERNAL_API_KEY && req.headers['x-internal-api-key'] === process.env.INTERNAL_API_KEY),
+  message: { success: false, message: 'เรียกใช้งานระบบแจ้งเตือนบ่อยเกินไป กรุณาลองใหม่ภายหลัง' },
+}));
+
+const sensitiveActionLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'ทำรายการนี้บ่อยเกินไป กรุณาลองใหม่ภายหลัง' },
+});
+
+// Emergency quotas must be per authenticated account, not per shared NAT/IP.
+// A household or care home may have many elderly devices behind one IP.
+// Authenticate first, then cap abusive repeated SOS requests from each account.
+const emergencyActionLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => 'aha-sos:' + req.user.id,
+  message: { success: false, message: 'ส่งคำขอฉุกเฉินบ่อยเกินไป กรุณาติดต่อผู้ดูแลหรือโทรฉุกเฉินโดยตรง' },
+});
+
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({
+      success: true,
+      service: 'notification-service',
+      status: 'ok',
+      push: pushConfigured ? 'configured' : 'not_configured',
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(503).json({
+      success: false,
+      service: 'notification-service',
+      status: 'database_unavailable',
+    });
+  }
+});
+
+
+
+/* --------------------------------------------------------------------------
+ * WEB PUSH
+ * -------------------------------------------------------------------------- */
+
+app.get('/api/push/status', authenticate, async (req, res) => {
+  const result = await pool.query(`
+    SELECT COUNT(*)::int AS count
+    FROM push_subscriptions
+    WHERE user_id = $1 AND enabled = true
+  `, [req.user.id]);
+
+  res.json({
+    success: true,
+    configured: pushConfigured,
+    subscribed: result.rows[0].count > 0,
+    subscriptions: result.rows[0].count,
+    publicKey: pushConfigured ? process.env.VAPID_PUBLIC_KEY : null,
+  });
+});
+
+app.post('/api/push/subscribe', authenticate, async (req, res) => {
+  const { endpoint, keys } = req.body || {};
+
+  if (!pushConfigured) {
+    return res.status(503).json({
+      success: false,
+      message: 'Web Push is not configured on the server',
+    });
+  }
+
+  if (!endpoint || !keys?.p256dh || !keys?.auth) {
+    return res.status(400).json({
+      success: false,
+      message: 'A valid PushSubscription is required',
+    });
+  }
+  if (typeof endpoint !== 'string' || !isAllowedPushEndpoint(endpoint) || endpoint.length > 2048 ||
+      typeof keys.p256dh !== 'string' || keys.p256dh.length > 512 ||
+      typeof keys.auth !== 'string' || keys.auth.length > 256) {
+    return res.status(400).json({ success: false, message: 'PushSubscription fields are invalid' });
+  }
+
+  try {
+    const result = await pool.query(`
+      INSERT INTO push_subscriptions
+        (user_id, endpoint, p256dh, auth, user_agent, enabled, updated_at)
+      VALUES ($1, $2, $3, $4, $5, true, now())
+      ON CONFLICT (endpoint)
+      DO UPDATE SET
+        user_id = EXCLUDED.user_id,
+        p256dh = EXCLUDED.p256dh,
+        auth = EXCLUDED.auth,
+        user_agent = EXCLUDED.user_agent,
+        enabled = true,
+        updated_at = now()
+      RETURNING id, user_id, endpoint, enabled, updated_at
+    `, [
+      req.user.id,
+      endpoint,
+      keys.p256dh,
+      keys.auth,
+      req.headers['user-agent'] || null,
+    ]);
+
+    res.status(201).json({
+      success: true,
+      data: result.rows[0],
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to save push subscription' });
+  }
+});
+
+app.delete('/api/push/subscribe', authenticate, async (req, res) => {
+  const { endpoint } = req.body || {};
+  if (!endpoint) {
+    return res.status(400).json({ success: false, message: 'endpoint is required' });
+  }
+
+  await pool.query(`
+    DELETE FROM push_subscriptions
+    WHERE endpoint = $1 AND user_id = $2
+  `, [endpoint, req.user.id]);
+
+  res.json({ success: true });
+});
+
+/* --------------------------------------------------------------------------
+ * SUPPORT CONTACT (Resend)
+ * -------------------------------------------------------------------------- */
+
+app.post('/api/support/contact', sensitiveActionLimiter, authenticate, async (req, res) => {
+  const name = String(req.body?.name || '').trim().slice(0, 100);
+  const email = String(req.body?.email || '').trim().toLowerCase().slice(0, 254);
+  const issue = String(req.body?.issue || '').trim().slice(0, 4000);
+  const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  if (!name || !emailPattern.test(email) || issue.length < 5) {
+    return res.status(400).json({ success: false, message: 'กรุณากรอกชื่อ อีเมล และรายละเอียดปัญหาให้ครบถ้วน' });
+  }
+
+  return res.status(503).json({ success: false, message: 'ระบบส่งอีเมลถูกปิดในฉบับ Academic' });
+});
+
+/* --------------------------------------------------------------------------
+ * NOTIFICATIONS
+ * -------------------------------------------------------------------------- */
+
+app.get('/api/notifications', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, type, title, message, related_id, is_read,
+             created_at, read_at, scheduled_at, delivered_at
+      FROM notifications
+      WHERE user_id = $1
+      ORDER BY created_at DESC
+    `, [req.user.id]);
+
+    res.json({ success: true, data: result.rows });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to fetch notifications' });
+  }
+});
+
+app.get('/api/notifications/unread', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, type, title, message, related_id, is_read,
+             created_at, scheduled_at, delivered_at
+      FROM notifications
+      WHERE user_id = $1 AND is_read = false
+      ORDER BY created_at DESC
+    `, [req.user.id]);
+
+    res.json({ success: true, data: result.rows, count: result.rowCount });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to fetch unread notifications' });
+  }
+});
+
+app.get('/api/notifications/:id', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT * FROM notifications
+      WHERE id = $1 AND user_id = $2
+    `, [req.params.id, req.user.id]);
+
+    if (!result.rowCount) {
+      return res.status(404).json({ success: false, message: 'Notification not found' });
+    }
+
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to fetch notification' });
+  }
+});
+
+app.post('/api/notifications', authenticate, async (req, res) => {
+  const {
+    user_id,
+    type,
+    title,
+    message,
+    related_id,
+    dedupe_key,
+    scheduled_at,
+  } = req.body;
+
+  const safeType = String(type || '').trim();
+  const safeTitle = String(title || '').trim();
+  const safeMessage = String(message || '').trim();
+
+  if (!safeType || !safeTitle || !safeMessage) {
+    return res.status(400).json({ success: false, message: 'type, title and message are required' });
+  }
+  if (safeType.length > 50 || safeTitle.length > 200 || safeMessage.length > 4000) {
+    return res.status(400).json({ success: false, message: 'notification content is too long' });
+  }
+
+  if (req.user.role !== 'system') {
+    return res.status(403).json({ success: false, message: 'Notification creation is restricted to internal services' });
+  }
+  const targetUserId = user_id;
+
+  if (!targetUserId) {
+    return res.status(400).json({ success: false, message: 'user_id is required for system notification' });
+  }
+
+  try {
+    const result = await pool.query(`
+      INSERT INTO notifications
+        (user_id, type, title, message, related_id, dedupe_key, scheduled_at, delivered_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,now())
+      ON CONFLICT (dedupe_key) DO NOTHING
+      RETURNING *
+    `, [
+      targetUserId,
+      safeType,
+      safeTitle,
+      safeMessage,
+      related_id || null,
+      dedupe_key || null,
+      scheduled_at || null,
+    ]);
+
+    const row = result.rows[0] || null;
+
+    if (row) {
+      await pushNotificationRow(row);
+    }
+
+    res.status(201).json({
+      success: true,
+      duplicate: result.rowCount === 0,
+      data: row,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to create notification' });
+  }
+});
+
+app.post('/api/notifications/emergency', authenticate, emergencyActionLimiter, async (req, res) => {
+  const body = req.body || {};
+  if (hasLocationFields(body)) {
+    return res.status(400).json({ success: false, code: 'ACADEMIC_LOCATION_DISABLED', message: 'Location fields are disabled in Academic Edition' });
+  }
+  const { message = 'มีการขอความช่วยเหลือฉุกเฉินจากผู้ใช้ AHA' } = body;
+  const safeMessage = String(message || '').trim();
+  if (!safeMessage || safeMessage.length > 500) {
+    return res.status(400).json({ success: false, message: 'Emergency message must contain 1–500 characters' });
+  }
+
+  const authUrl = process.env.AUTH_SERVICE_URL;
+  const internalKey = process.env.INTERNAL_API_KEY;
+
+  if (!authUrl || !internalKey) {
+    return res.status(500).json({ success: false, message: 'Emergency service integration is not configured' });
+  }
+
+  try {
+    let recipientIds = [];
+    try {
+      const recipientsResponse = await fetch(
+        `${authUrl.replace(/\/$/, '')}/family/internal/${req.user.id}/recipients`,
+        { headers: { 'x-internal-api-key': internalKey }, redirect: 'error', signal: AbortSignal.timeout(10000) }
+      );
+      if (recipientsResponse.ok) {
+        const recipientsPayload = await recipientsResponse.json();
+        if (Array.isArray(recipientsPayload.data) && recipientsPayload.data.length) {
+          recipientIds = [...new Set(recipientsPayload.data)]
+            .filter((userId) => String(userId) !== String(req.user.id));
+        }
+      } else {
+        await recipientsResponse.text(); // Drain without logging upstream body.
+        console.error('Emergency recipient lookup failed:', recipientsResponse.status);
+        return res.status(502).json({
+          success: false,
+          code: 'EMERGENCY_RECIPIENT_LOOKUP_FAILED',
+          message: 'ระบบเชื่อมต่อผู้ดูแลขัดข้อง กรุณาลองใหม่อีกครั้ง',
+        });
+      }
+    } catch (lookupError) {
+      console.error('Emergency recipient lookup error:', lookupError);
+      return res.status(502).json({
+        success: false,
+        code: 'EMERGENCY_RECIPIENT_LOOKUP_FAILED',
+        message: 'ระบบเชื่อมต่อผู้ดูแลขัดข้อง กรุณาลองใหม่อีกครั้ง',
+      });
+    }
+
+    if (!recipientIds.length) {
+      return res.status(404).json({
+        success: false,
+        code: 'NO_ACCEPTED_FAMILY_CONNECTION',
+        message: 'บัญชีนี้ยังไม่มีผู้ใช้ฝั่งตรงข้ามที่เชื่อมต่อและยืนยันแล้ว',
+      });
+    }
+
+    const locationText = ' (Academic simulation — ไม่ใช้ GPS จริง)';
+
+    const created = [];
+    let pushProviderAccepted = 0;
+
+    for (const userId of recipientIds) {
+      const result = await pool.query(`
+        INSERT INTO notifications
+          (user_id, type, title, message, dedupe_key, delivered_at)
+        VALUES ($1, 'emergency', $2, $3, $4, now())
+        ON CONFLICT (dedupe_key) DO NOTHING
+        RETURNING *
+      `, [
+        userId,
+        'SOS จำลองจากผู้ใช้ที่เชื่อมต่อ (Academic)',
+        `${safeMessage}${locationText}`,
+        `emergency:${req.user.id}:${userId}:${Date.now()}`,
+      ]);
+
+      if (result.rowCount) {
+        created.push(result.rows[0]);
+        const pushStatus = await pushNotificationRow(result.rows[0]);
+        pushProviderAccepted += Number(pushStatus?.sent || 0);
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      notified: created.length, // Recorded notifications, NOT confirmed device receipt.
+      recipients: recipientIds.length,
+      pushProviderAccepted, // Push service accepted the request, not proof it was displayed.
+      deviceReceiptConfirmed: false,
+      message: 'บันทึกคำขอ SOS แล้ว แต่ยังไม่ยืนยันว่าผู้ดูแลได้รับการแจ้งเตือน หากฉุกเฉินกรุณาโทร 1669 ทันที',
+      data: created,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to send emergency notification' });
+  }
+});
+
+app.patch('/api/notifications/:id/read', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      UPDATE notifications
+      SET is_read = true, read_at = now()
+      WHERE id = $1 AND user_id = $2
+      RETURNING *
+    `, [req.params.id, req.user.id]);
+
+    if (!result.rowCount) {
+      return res.status(404).json({ success: false, message: 'Notification not found' });
+    }
+
+    res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to mark notification as read' });
+  }
+});
+
+app.patch('/api/notifications/read-all', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      UPDATE notifications
+      SET is_read = true, read_at = now()
+      WHERE user_id = $1 AND is_read = false
+    `, [req.user.id]);
+
+    res.json({ success: true, message: 'All notifications marked as read', updated: result.rowCount });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to mark notifications as read' });
+  }
+});
+
+app.delete('/api/notifications/:id', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      DELETE FROM notifications
+      WHERE id = $1 AND user_id = $2
+      RETURNING id
+    `, [req.params.id, req.user.id]);
+
+    if (!result.rowCount) {
+      return res.status(404).json({ success: false, message: 'Notification not found' });
+    }
+
+    res.json({ success: true, message: 'Notification deleted' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, message: 'Failed to delete notification' });
+  }
+});
+
+app.use((req, res) => res.status(404).json({ success: false, message: 'Not found' }));
+
+app.use((error, req, res, next) => {
+  console.error(error);
+  if (error.message === 'Not allowed by CORS') {
+    return res.status(403).json({ success: false, message: 'CORS origin not allowed' });
+  }
+  const status = error.statusCode || error.status || 500;
+  res.status(status).json({ success: false, message: status === 500 ? 'Internal server error' : error.message });
+});
+
+const PORT = process.env.PORT || 3003;
+
+function assertProductionSecurity() {
+  if (process.env.NODE_ENV !== 'production') return;
+  const values = [String(process.env.JWT_SECRET || ''), String(process.env.INTERNAL_API_KEY || '')];
+  const weak = (value) => value.length < 48 || /replace|change|example|development|password|secret/i.test(value) || new Set(value).size < 12;
+  if (values.some(weak) || values[0] === values[1]) {
+    throw new Error('Production JWT_SECRET and INTERNAL_API_KEY must be different random values of at least 48 characters');
+  }
+}
+
+if (require.main === module) {
+  assertProductionSecurity();
+  ensureRuntimeSchema()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Notification service running on port ${PORT}`);
+        console.log(`Web Push: ${pushConfigured ? 'configured' : 'NOT CONFIGURED'}`);
+        startNotificationRetention(pool);
+      });
+    })
+    .catch((error) => {
+      console.error('Notification runtime schema failed:', error);
+      process.exit(1);
+    });
+}
+
+module.exports = app;
+// Isolated CI uses the same runtime initialization, without starting workers.
+module.exports.ensureRuntimeSchema = ensureRuntimeSchema;

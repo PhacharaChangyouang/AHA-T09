@@ -1,0 +1,38 @@
+{
+  "name": "aha-frontend",
+  "version": "1.0.0",
+  "description": "AHA — PWA frontend for elderly + caregiver",
+  "private": true,
+  "browserslist": [
+    "Chrome >= 69",
+    "Android >= 8",
+    "and_chr >= 69"
+  ],
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint src",
+    "test:voice": "node --test tests/voice-understanding.test.mjs"
+  },
+  "dependencies": {
+    "next": "15.5.29",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0"
+  },
+  "devDependencies": {
+    "eslint": "9.39.5",
+    "eslint-plugin-jsx-a11y": "6.10.2",
+    "eslint-plugin-react": "7.37.5",
+    "eslint-plugin-react-hooks": "7.1.1"
+  },
+  "overrides": {
+    "postcss": "8.5.23",
+    "nanoid": "3.3.18",
+    "sharp": "0.35.5",
+    "source-map-js": "1.2.2"
+  },
+  "engines": {
+    "node": "22.23.4"
+  }
+}

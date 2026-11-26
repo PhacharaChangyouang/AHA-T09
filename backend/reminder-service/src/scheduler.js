@@ -1,0 +1,172 @@
+require('dotenv').config();
+
+const pool = require('./config/db');
+const { singleFlight, internalRequestOptions, fetchRecipientPayload } = require('./scheduler-guard');
+
+const TZ = 'Asia/Bangkok';
+const MAX_LATE_MINUTES = 10;
+
+function localParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: TZ,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date);
+  const get = (type) => parts.find((p) => p.type === type)?.value || '';
+  return {
+    date: `${get('year')}-${get('month')}-${get('day')}`,
+    time: `${get('hour')}:${get('minute')}`,
+    day: new Intl.DateTimeFormat('en-US', { timeZone: TZ, weekday: 'long' }).format(date).toLowerCase(),
+  };
+}
+
+function isSnoozeDue(reminder, nowDate = new Date()) {
+  return Boolean(reminder.snooze_until && new Date(reminder.snooze_until).getTime() <= nowDate.getTime());
+}
+
+function scheduledDateTime(date, time) {
+  return new Date(`${date}T${String(time).slice(0, 5)}:00+07:00`);
+}
+
+// pg returns DATE columns as local-midnight Date objects. Preserve their
+// calendar fields; String(Date) is not sortable and UTC conversion can shift a day.
+function calendarDate(value) {
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return null;
+    return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+  }
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value) ? value.slice(0, 10) : null;
+}
+
+function isDue(reminder, now, nowDate = new Date()) {
+  if (!reminder.is_active) return false;
+  if (isSnoozeDue(reminder, nowDate)) return true;
+  if (reminder.snooze_until) return false;
+  if (reminder.start_date && calendarDate(reminder.start_date) > now.date) return false;
+  if (reminder.end_date && calendarDate(reminder.end_date) < now.date) return false;
+  const days = Array.isArray(reminder.days_of_week) ? reminder.days_of_week.map(String) : [];
+  if (!days.includes(now.day)) return false;
+  const scheduled = scheduledDateTime(now.date, reminder.reminder_time);
+  const diffMinutes = Math.floor((nowDate.getTime() - scheduled.getTime()) / 60000);
+  return diffMinutes >= 0 && diffMinutes <= MAX_LATE_MINUTES;
+}
+
+async function getRecipients(reminder) {
+  const authUrl = process.env.AUTH_SERVICE_URL;
+  const internalKey = process.env.INTERNAL_API_KEY;
+  if (!authUrl || !internalKey) throw new Error('AUTH_SERVICE_URL and INTERNAL_API_KEY are required');
+  const payload = await fetchRecipientPayload(`${authUrl.replace(/\/$/, '')}/family/internal/${reminder.user_id}/recipients`, { 'x-internal-api-key': internalKey });
+  // Medicine reminders must always notify the reminder owner (elderly).
+  // Family lookup now intentionally returns only linked counterparts, so add
+  // the owner explicitly and then de-duplicate recipients.
+  const linkedRecipients = Array.isArray(payload.data) ? payload.data : [];
+  return [...new Set([reminder.user_id, ...linkedRecipients])];
+}
+
+async function notifyRecipients(reminder, triggerKey, { late = false } = {}) {
+  const notificationUrl = process.env.NOTIFICATION_SERVICE_URL;
+  const internalKey = process.env.INTERNAL_API_KEY;
+  if (!notificationUrl || !internalKey) throw new Error('NOTIFICATION_SERVICE_URL and INTERNAL_API_KEY are required');
+
+  const recipients = await getRecipients(reminder);
+
+  for (const userId of recipients) {
+    const isElderly = String(userId) === String(reminder.user_id);
+    const type = isElderly ? 'medicine_reminder' : 'caregiver_medicine_status';
+    const title = late
+      ? (isElderly ? 'เลยเวลาทานยา' : 'ผู้สูงอายุยังไม่ได้ยืนยันการทานยา')
+      : (isElderly
+          ? (triggerKey.startsWith('snooze:') ? 'ถึงเวลาทานยาอีกครั้ง' : 'ถึงเวลาเตือนยา')
+          : 'แจ้งเตือนการทานยาของผู้สูงอายุ');
+    const message = late
+      ? (isElderly
+          ? `ยังไม่ได้ยืนยันการทานยา ${reminder.medicine_name}${reminder.dosage ? ` (${reminder.dosage})` : ''} กรุณาตรวจสอบและยืนยันการทานยา`
+          : `ยังไม่มีการยืนยันว่าผู้สูงอายุทานยา ${reminder.medicine_name}${reminder.dosage ? ` (${reminder.dosage})` : ''} ตามเวลาที่กำหนด`)
+      : (isElderly
+          ? `ถึงเวลาทานยา ${reminder.medicine_name}${reminder.dosage ? ` (${reminder.dosage})` : ''}`
+          : `ถึงเวลาทานยา ${reminder.medicine_name}${reminder.dosage ? ` (${reminder.dosage})` : ''} ของผู้สูงอายุที่คุณดูแล`);
+
+    const response = await fetch(`${notificationUrl.replace(/\/$/, '')}/api/notifications`, {
+      ...internalRequestOptions(),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-internal-api-key': internalKey },
+      body: JSON.stringify({
+        user_id: userId,
+        type,
+        title,
+        message,
+        related_id: reminder.id,
+        dedupe_key: `reminder:${reminder.id}:${userId}:${type}:${triggerKey}`,
+      }),
+    });
+    if (!response.ok) throw new Error(`Notification create failed: ${response.status}`);
+  }
+}
+
+async function processDueReminders() {
+  const now = localParts();
+  const nowDate = new Date();
+  const result = await pool.query(`SELECT * FROM reminders WHERE is_active = true AND (start_date IS NULL OR start_date <= $1::date) AND (end_date IS NULL OR end_date >= $1::date)`, [now.date]);
+  for (const reminder of result.rows) {
+    const snoozeDue = isSnoozeDue(reminder, nowDate);
+    if (!isDue(reminder, now, nowDate)) continue;
+    const triggerKey = snoozeDue ? `snooze:${new Date(reminder.snooze_until).toISOString().slice(0, 16)}` : `${now.date}:${String(reminder.reminder_time).slice(0, 5)}`;
+    if (reminder.last_triggered_key === triggerKey) continue;
+    try {
+      await notifyRecipients(reminder, triggerKey);
+      await pool.query(`UPDATE reminders SET last_triggered_key = $1, last_late_triggered_key = NULL, snooze_until = CASE WHEN $2 THEN NULL ELSE snooze_until END, updated_at = now() WHERE id = $3 AND is_active = true AND (last_triggered_key IS DISTINCT FROM $1)`, [triggerKey, snoozeDue, reminder.id]);
+      console.log('Academic reminder recorded');
+    } catch (error) {
+      console.error('Reminder notification failed (will retry):', error.message);
+    }
+  }
+}
+
+function getTriggerDateTime(reminder, nowDate) {
+  const key = String(reminder.last_triggered_key || '');
+  if (key.startsWith('snooze:')) {
+    const parsed = new Date(key.slice('snooze:'.length));
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+  const now = localParts(nowDate);
+  const normalKey = `${now.date}:${String(reminder.reminder_time).slice(0, 5)}`;
+  if (key !== normalKey) return null;
+  return scheduledDateTime(now.date, reminder.reminder_time);
+}
+
+async function processLateReminders() {
+  const nowDate = new Date();
+  const now = localParts(nowDate);
+  const result = await pool.query(`SELECT r.* FROM reminders r WHERE r.is_active = true AND (r.start_date IS NULL OR r.start_date <= $1::date) AND (r.end_date IS NULL OR r.end_date >= $1::date) AND r.last_triggered_key IS NOT NULL AND (r.last_late_triggered_key IS NULL)`, [now.date]);
+  for (const reminder of result.rows) {
+    const triggerAt = getTriggerDateTime(reminder, nowDate);
+    if (!triggerAt) continue;
+    const elapsedMinutes = Math.floor((nowDate.getTime() - triggerAt.getTime()) / 60000);
+    if (elapsedMinutes < MAX_LATE_MINUTES) continue;
+    const log = await pool.query(`SELECT 1 FROM reminder_logs WHERE reminder_id = $1 AND user_id = $2 AND scheduled_date = $3::date AND status = 'taken' LIMIT 1`, [reminder.id, reminder.user_id, now.date]);
+    if (log.rowCount) continue;
+    const lateKey = `late:${reminder.last_triggered_key}`;
+    try {
+      await notifyRecipients(reminder, lateKey, { late: true });
+      await pool.query(`UPDATE reminders SET last_late_triggered_key = $1, updated_at = now() WHERE id = $2 AND is_active = true AND last_late_triggered_key IS DISTINCT FROM $1`, [lateKey, reminder.id]);
+      console.log('Academic reminder recorded');
+    } catch (error) {
+      console.error('Late reminder notification failed (will retry):', error.message);
+    }
+  }
+}
+
+function startScheduler() {
+  // Independent lanes prevent an overlapping tick without blocking late alerts behind due alerts.
+  const runDue = singleFlight(processDueReminders);
+  const runLate = singleFlight(processLateReminders);
+  const run = () => Promise.allSettled([runDue(), runLate()]).then(results => {
+    for (const result of results) if (result.status === 'rejected') console.error('Scheduler cycle failed');
+  });
+  run();
+  setInterval(run, 15 * 1000);
+  console.log(`Reminder scheduler started (15s interval, Asia/Bangkok, ${MAX_LATE_MINUTES}m late alert)`);
+}
+
+module.exports = { startScheduler, processDueReminders, processLateReminders, localParts, isDue, isSnoozeDue };
+
