@@ -33,3 +33,8 @@
 - [Test data plan](07-test-data-plan.md) + fixture/seed draft
 - [D13 OpenAPI preparation](08-d13-openapi-preparation.md) + contract subset / HTTP runner
 - ยังไม่ใช่งานส่ง: ไม่มี Docker/PostgreSQL/HTTP execution evidence; เก็บใน preparation เท่านั้น
+
+## Test reuse preparation
+- [Test reuse matrix](09-test-reuse-matrix.md): aggregate comparison and requirement mapping.
+- [Historical evidence handling](10-historical-evidence-handling.md): restricted evidence and academic rerun rules.
+- Extended fixture-based HTTP runner and draft OpenAPI; not executed.
