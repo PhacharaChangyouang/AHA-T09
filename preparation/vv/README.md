@@ -28,3 +28,8 @@
 - SRS Word ที่ตรวจตรงกับ Git blob 4fb264d700562b325e7af3e9e92c6591658b4d23; tag srs-v1.0 ยังชี้ bef86e9ead20b89d706df1402f053958a016cadd
 
 ไม่เผยแพร่ข้อมูลผู้ตอบ SUS รายบุคคล, ข้อมูลสุขภาพจริง, credential, log ภายใน หรือรายละเอียด Production เพิ่มเติม Branch นี้อยู่ใน repo Public จึงเก็บเฉพาะข้อมูลวิชาการและผลตรวจเอกสารที่ไม่เพิ่มข้อมูลอ่อนไหว
+
+## เพิ่มเติมหลังได้รับโจทย์ Test Data / D13 ฉบับเต็ม
+- [Test data plan](07-test-data-plan.md) + fixture/seed draft
+- [D13 OpenAPI preparation](08-d13-openapi-preparation.md) + contract subset / HTTP runner
+- ยังไม่ใช่งานส่ง: ไม่มี Docker/PostgreSQL/HTTP execution evidence; เก็บใน preparation เท่านั้น

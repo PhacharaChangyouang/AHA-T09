@@ -1,0 +1,230 @@
+{
+  "version": "draft-1",
+  "anchor": "2027-02-02T00:00:00Z",
+  "users": [
+    {
+      "key": "E01",
+      "id": "1000000-0000-4000-8000-000000000001",
+      "role": "elderly",
+      "age": 60,
+      "username": "fixture_e01",
+      "email": "e01@example.invalid",
+      "phone": "TEST-E01",
+      "name": "Synthetic E01"
+    },
+    {
+      "key": "E02",
+      "id": "1000000-0000-4000-8000-000000000002",
+      "role": "elderly",
+      "age": 75,
+      "username": "fixture_e02",
+      "email": "e02@example.invalid",
+      "phone": "TEST-E02",
+      "name": "Synthetic E02"
+    },
+    {
+      "key": "C01",
+      "id": "1000000-0000-4000-8000-000000000003",
+      "role": "caregiver",
+      "age": 35,
+      "username": "fixture_c01",
+      "email": "c01@example.invalid",
+      "phone": "TEST-C01",
+      "name": "Synthetic C01"
+    },
+    {
+      "key": "C02",
+      "id": "1000000-0000-4000-8000-000000000004",
+      "role": "caregiver",
+      "age": 40,
+      "username": "fixture_c02",
+      "email": "c02@example.invalid",
+      "phone": "TEST-C02",
+      "name": "Synthetic C02"
+    },
+    {
+      "key": "C03",
+      "id": "1000000-0000-4000-8000-000000000005",
+      "role": "caregiver",
+      "age": 30,
+      "username": "fixture_c03",
+      "email": "c03@example.invalid",
+      "phone": "TEST-C03",
+      "name": "Synthetic C03"
+    }
+  ],
+  "links": [
+    {
+      "id": "2000000-0000-4000-8000-000000000001",
+      "requester_id": "1000000-0000-4000-8000-000000000003",
+      "requested_id": "1000000-0000-4000-8000-000000000001",
+      "status": "accepted"
+    },
+    {
+      "id": "2000000-0000-4000-8000-000000000002",
+      "requester_id": "1000000-0000-4000-8000-000000000004",
+      "requested_id": "1000000-0000-4000-8000-000000000002",
+      "status": "accepted"
+    },
+    {
+      "id": "2000000-0000-4000-8000-000000000003",
+      "requester_id": "1000000-0000-4000-8000-000000000005",
+      "requested_id": "1000000-0000-4000-8000-000000000001",
+      "status": "pending"
+    },
+    {
+      "id": "2000000-0000-4000-8000-000000000004",
+      "requester_id": "1000000-0000-4000-8000-000000000005",
+      "requested_id": "1000000-0000-4000-8000-000000000002",
+      "status": "rejected"
+    }
+  ],
+  "reminders": [
+    {
+      "id": "3000000-0000-4000-8000-000000000001",
+      "user_id": "1000000-0000-4000-8000-000000000001",
+      "medicine_name": "FIXTURE-MED-01",
+      "dosage": "synthetic unit",
+      "reminder_time": "00:00",
+      "frequency": "daily",
+      "days_of_week": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday"
+      ],
+      "start_date": null,
+      "end_date": null,
+      "is_active": true
+    },
+    {
+      "id": "3000000-0000-4000-8000-000000000002",
+      "user_id": "1000000-0000-4000-8000-000000000001",
+      "medicine_name": "FIXTURE-MED-02",
+      "dosage": "synthetic unit",
+      "reminder_time": "23:59",
+      "frequency": "daily",
+      "days_of_week": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday"
+      ],
+      "start_date": null,
+      "end_date": null,
+      "is_active": true
+    },
+    {
+      "id": "3000000-0000-4000-8000-000000000003",
+      "user_id": "1000000-0000-4000-8000-000000000001",
+      "medicine_name": "FIXTURE-MED-03",
+      "dosage": "synthetic unit",
+      "reminder_time": "08:00",
+      "frequency": "weekly",
+      "days_of_week": [
+        "monday"
+      ],
+      "start_date": null,
+      "end_date": null,
+      "is_active": true
+    },
+    {
+      "id": "3000000-0000-4000-8000-000000000004",
+      "user_id": "1000000-0000-4000-8000-000000000001",
+      "medicine_name": "FIXTURE-MED-04",
+      "dosage": "synthetic unit",
+      "reminder_time": "12:00",
+      "frequency": "daily",
+      "days_of_week": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday"
+      ],
+      "start_date": null,
+      "end_date": null,
+      "is_active": false
+    },
+    {
+      "id": "3000000-0000-4000-8000-000000000005",
+      "user_id": "1000000-0000-4000-8000-000000000002",
+      "medicine_name": "FIXTURE-MED-05",
+      "dosage": "synthetic unit",
+      "reminder_time": "09:00",
+      "frequency": "daily",
+      "days_of_week": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday"
+      ],
+      "start_date": "2099-01-01",
+      "end_date": null,
+      "is_active": true
+    },
+    {
+      "id": "3000000-0000-4000-8000-000000000006",
+      "user_id": "1000000-0000-4000-8000-000000000002",
+      "medicine_name": "FIXTURE-MED-06",
+      "dosage": "synthetic unit",
+      "reminder_time": "10:00",
+      "frequency": "daily",
+      "days_of_week": [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday"
+      ],
+      "start_date": "2000-01-01",
+      "end_date": "2000-01-02",
+      "is_active": true
+    }
+  ],
+  "notifications": [
+    {
+      "id": "4000000-0000-4000-8000-000000000001",
+      "user_id": "1000000-0000-4000-8000-000000000001",
+      "type": "caregiver_medicine_status",
+      "title": "Synthetic fixture 1",
+      "message": "TEST ONLY — no real health information",
+      "related_id": "3000000-0000-4000-8000-000000000001",
+      "is_read": false,
+      "dedupe_key": "fixture-notification-1"
+    },
+    {
+      "id": "4000000-0000-4000-8000-000000000002",
+      "user_id": "1000000-0000-4000-8000-000000000002",
+      "type": "caregiver_medicine_status",
+      "title": "Synthetic fixture 2",
+      "message": "TEST ONLY — no real health information",
+      "related_id": "3000000-0000-4000-8000-000000000005",
+      "is_read": true,
+      "dedupe_key": "fixture-notification-2"
+    },
+    {
+      "id": "4000000-0000-4000-8000-000000000003",
+      "user_id": "1000000-0000-4000-8000-000000000003",
+      "type": "caregiver_medicine_status",
+      "title": "Synthetic fixture 3",
+      "message": "TEST ONLY — no real health information",
+      "related_id": "3000000-0000-4000-8000-000000000001",
+      "is_read": false,
+      "dedupe_key": "fixture-notification-3"
+    }
+  ]
+}
