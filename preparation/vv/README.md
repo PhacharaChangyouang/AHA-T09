@@ -11,6 +11,7 @@
 | [Master Test Plan draft](03-master-test-plan-draft.md) | เตรียม CP2 ตาม V&V Strategy |
 | [Requirement/test design matrix](04-requirement-test-design.md) | เตรียม CP3: 64 รายการ, Given–When–Then และกรณีทดสอบย่อย |
 | [Existing test inventory](05-existing-test-inventory.md) | รายการไฟล์ทดสอบที่มีจริง แยกอ่าน source กับรันทดสอบ |
+| [D13 Integration/API preparation](06-d13-integration-api-preparation.md) | ตรวจหลักฐานเดิม สคริปต์ที่ขาด และร่างกรณีทดสอบก่อนถึงกำหนด |
 
 ## เกณฑ์ก่อนส่งจริง
 - D07: ตรวจและรับรอง SRS 1.0 ทั้ง Word/PDF, ที่มาและความสำคัญรายข้อ, ปิดหรือกำหนดผู้รับผิดชอบ/วันตัดสิน TBD; ตรวจ tag ที่อ้าง baseline เดิมก่อนเปลี่ยนโดยตกลงกับอาจารย์
